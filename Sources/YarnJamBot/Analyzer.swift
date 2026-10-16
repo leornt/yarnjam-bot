@@ -246,36 +246,61 @@ private func findPegs(_ bitmap: Bitmap, tray: CGRect) -> [PegReading] {
             let bh = blob.maxY - blob.minY + 1
             let aspect = CGFloat(bw) / CGFloat(max(bh, 1))
             let fill = CGFloat(blob.area) / CGFloat(max(bw * bh, 1))
-            guard blob.area >= minArea, blob.area <= maxArea, aspect > 0.55, aspect < 1.8, fill > 0.45 else {
+            // A yarn on a peg leaves a short white cap, wider than the cone.
+            guard blob.area >= minArea, blob.area <= maxArea, aspect > 0.55, aspect < 2.6, fill > 0.45 else {
                 continue
             }
             blobs.append(blob)
         }
     }
 
-    guard blobs.count >= 5 else { return [] }
     let ordered = collapseStacked(blobs.sorted { $0.center.x < $1.center.x })
+    if let pegs = selectPegRow(bitmap, ordered) { return pegs }
+    guard let covered = coveredPeg(bitmap, columns: ordered) else { return [] }
+    var withCovered = ordered
+    withCovered.append(covered)
+    withCovered.sort { $0.center.x < $1.center.x }
+    return selectPegRow(bitmap, withCovered) ?? []
+}
+
+private struct PegRowMetrics {
+    var spacing: CGFloat
+    var std: CGFloat
+    var meanY: CGFloat
+    var meanR: CGFloat
+    var ySpan: CGFloat
+}
+
+/// Evenly spaced pegs on one horizontal line.
+private func pegRowMetrics(_ group: [Blob]) -> PegRowMetrics? {
+    guard group.count >= 2 else { return nil }
+    let ys = group.map(\.center.y)
+    let ySpan = (ys.max() ?? 0) - (ys.min() ?? 0)
+    let radii = group.map(\.radius)
+    let meanR = radii.reduce(0, +) / CGFloat(group.count)
+    guard meanR > 4, ySpan < meanR * 2.2 else { return nil }
+    var spacings: [CGFloat] = []
+    for index in 0..<(group.count - 1) {
+        spacings.append(group[index + 1].center.x - group[index].center.x)
+    }
+    let meanS = spacings.reduce(0, +) / CGFloat(spacings.count)
+    guard meanS > meanR * 1.4 else { return nil }
+    let variance = spacings.reduce(0) { $0 + ($1 - meanS) * ($1 - meanS) } / CGFloat(spacings.count)
+    let std = variance.squareRoot()
+    guard std / meanS < 0.22 else { return nil }
+    let radiusSpread = (radii.max() ?? 0) - (radii.min() ?? 0)
+    guard radiusSpread < meanR * 0.8 else { return nil }
+    let meanY = ys.reduce(0, +) / CGFloat(ys.count)
+    return PegRowMetrics(spacing: meanS, std: std, meanY: meanY, meanR: meanR, ySpan: ySpan)
+}
+
+private func selectPegRow(_ bitmap: Bitmap, _ ordered: [Blob]) -> [PegReading]? {
+    guard ordered.count >= 5 else { return nil }
     var best: (score: CGFloat, pegs: [PegReading])?
     for i in 0...(ordered.count - 5) {
         let group = Array(ordered[i..<(i + 5)])
-        let ys = group.map(\.center.y)
-        let ySpan = (ys.max() ?? 0) - (ys.min() ?? 0)
-        let radii = group.map(\.radius)
-        let meanR = radii.reduce(0, +) / 5
-        guard meanR > 4 else { continue }
-        guard ySpan < meanR * 2.2 else { continue }
-        var spacings: [CGFloat] = []
-        for s in 0..<4 {
-            spacings.append(group[s + 1].center.x - group[s].center.x)
-        }
-        let meanS = spacings.reduce(0, +) / 4
-        guard meanS > meanR * 1.4 else { continue }
-        let variance = spacings.reduce(0) { $0 + ($1 - meanS) * ($1 - meanS) } / 4
-        let std = variance.squareRoot()
-        guard std / meanS < 0.22 else { continue }
-        let radiusSpread = (radii.max() ?? 0) - (radii.min() ?? 0)
-        guard radiusSpread < meanR * 0.8 else { continue }
-        let score = meanS / (1 + std) - ySpan
+        guard let metrics = pegRowMetrics(group) else { continue }
+        let score = metrics.spacing / (1 + metrics.std) - metrics.ySpan
         if best == nil || score > best!.score {
             let pegs = group.enumerated().map { offset, blob in
                 occupiedPeg(bitmap, blob: blob, index: offset + 1)
@@ -283,7 +308,67 @@ private func findPegs(_ bitmap: Bitmap, tray: CGRect) -> [PegReading] {
             best = (score, pegs)
         }
     }
-    return best?.pegs ?? []
+    return best?.pegs
+}
+
+/// A yarn can hide a peg completely. The missing spot is one spacing outside an even row of four, where the yarn color sits.
+private func coveredPeg(_ bitmap: Bitmap, columns: [Blob]) -> Blob? {
+    guard columns.count >= 4 else { return nil }
+    var best: Blob?
+    var bestArea = 0
+    for i in 0...(columns.count - 4) {
+        let group = Array(columns[i..<(i + 4)])
+        guard let metrics = pegRowMetrics(group) else { continue }
+        let sides = [
+            group[0].center.x - metrics.spacing,
+            group[3].center.x + metrics.spacing,
+        ]
+        for x in sides {
+            guard let blob = yarnBlob(bitmap, x: x, y: metrics.meanY, radius: metrics.meanR) else { continue }
+            if blob.area > bestArea {
+                bestArea = blob.area
+                best = blob
+            }
+        }
+    }
+    return best
+}
+
+/// Yarn color in the circle where a hidden peg would be. The box is the yarn, so occupancy is read from it.
+private func yarnBlob(_ bitmap: Bitmap, x: CGFloat, y: CGFloat, radius: CGFloat) -> Blob? {
+    let cx = Int(x.rounded())
+    let cy = Int(y.rounded())
+    let r = max(4, Int(radius * 1.3))
+    var blob = Blob(minX: cx, minY: cy, maxX: cx, maxY: cy, area: 0, sumX: 0, sumY: 0)
+    var samples = 0
+    for py in (cy - r)...(cy + r) {
+        for px in (cx - r)...(cx + r) {
+            let dx = px - cx, dy = py - cy
+            if dx * dx + dy * dy > r * r { continue }
+            guard bitmap.contains(px, py) else { continue }
+            samples += 1
+            guard isYarnOnPeg(bitmap[px, py]) else { continue }
+            if blob.area == 0 {
+                blob.minX = px
+                blob.maxX = px
+                blob.minY = py
+                blob.maxY = py
+            }
+            blob.area += 1
+            blob.sumX += px
+            blob.sumY += py
+            blob.minX = min(blob.minX, px)
+            blob.maxX = max(blob.maxX, px)
+            blob.minY = min(blob.minY, py)
+            blob.maxY = max(blob.maxY, py)
+        }
+    }
+    guard samples > 0, blob.area * 4 > samples else { return nil }
+    return blob
+}
+
+private func isYarnOnPeg(_ c: RGB) -> Bool {
+    c.saturation > 0.45 && c.value > 0.40 && !isBeige(c)
 }
 
 private func collapseStacked(_ blobs: [Blob]) -> [Blob] {
@@ -305,32 +390,33 @@ private func collapseStacked(_ blobs: [Blob]) -> [Blob] {
 
 private func occupiedPeg(_ bitmap: Bitmap, blob: Blob, index: Int) -> PegReading {
     let cx = Int(blob.center.x.rounded())
-    let cy = Int(blob.center.y.rounded())
-    let r = max(2, Int(blob.radius * 0.45))
-    var sumR = 0, sumG = 0, sumB = 0, n = 0
-    var satSum: Float = 0
+    // The yarn covers the cone from the bottom up and leaves the white cap above it.
+    let cy = blob.maxY
+    let r = max(3, Int(max(blob.radius, 4) * 0.95))
+    var sumR = 0, sumG = 0, sumB = 0, yarn = 0, samples = 0
     for y in (cy - r)...(cy + r) {
         for x in (cx - r)...(cx + r) {
-            guard bitmap.contains(x, y) else { continue }
             let dx = x - cx, dy = y - cy
             if dx * dx + dy * dy > r * r { continue }
+            guard bitmap.contains(x, y) else { continue }
+            samples += 1
             let c = bitmap[x, y]
+            guard isYarnOnPeg(c) else { continue }
             sumR += Int(c.r)
             sumG += Int(c.g)
             sumB += Int(c.b)
-            satSum += c.saturation
-            n += 1
+            yarn += 1
         }
     }
-    let color = n == 0
+    let occupied = samples > 0 && yarn * 5 > samples
+    let color = yarn == 0
         ? RGB(r: 255, g: 255, b: 255)
-        : RGB(r: UInt8(sumR / n), g: UInt8(sumG / n), b: UInt8(sumB / n))
-    let sat = n == 0 ? 0 : satSum / Float(n)
+        : RGB(r: UInt8(sumR / yarn), g: UInt8(sumG / yarn), b: UInt8(sumB / yarn))
     return PegReading(
         index: index,
         center: blob.center,
         radius: blob.radius,
-        occupied: sat > 0.38 && color.value > 0.35,
+        occupied: occupied,
         hue: color.hue
     )
 }
@@ -441,6 +527,14 @@ private func isWhitePaint(_ c: RGB) -> Bool {
     c.saturation < 0.10 && c.value > 0.80
 }
 
+/// A black or charcoal rim is nearly gray. It is darker than the cream seat and lighter than a hole.
+private func isDarkPaint(_ c: RGB) -> Bool {
+    let r = Int(c.r), g = Int(c.g), b = Int(c.b)
+    let maxC = max(r, g, b)
+    let minC = min(r, g, b)
+    return maxC > 32 && maxC < 85 && (maxC - minC) < 28 && !isBeige(c)
+}
+
 private struct RimReading {
     var box: CGRect
     var mean: RGB
@@ -460,6 +554,7 @@ private func findRim(_ bitmap: Bitmap, rect: CGRect) -> RimReading? {
 
     var paint = [Bool](repeating: false, count: w * h)
     var pastel = [Bool](repeating: false, count: w * h)
+    var dark = [Bool](repeating: false, count: w * h)
     var hues = [Float](repeating: 0, count: w * h)
     var white = [Bool](repeating: false, count: w * h)
     for y in 0..<h {
@@ -468,19 +563,28 @@ private func findRim(_ bitmap: Bitmap, rect: CGRect) -> RimReading? {
             hues[y * w + x] = c.hue
             if isPaint(c) { paint[y * w + x] = true }
             if isPastelPaint(c) { pastel[y * w + x] = true }
+            if isDarkPaint(c) { dark[y * w + x] = true }
             if isWhitePaint(c) { white[y * w + x] = true }
         }
     }
     for x in 0..<w {
-        var count = 0
-        for y in 0..<h where paint[y * w + x] { count += 1 }
-        if Double(count) >= Double(h) * 0.8 {
+        var paintCount = 0
+        var darkCount = 0
+        for y in 0..<h {
+            if paint[y * w + x] { paintCount += 1 }
+            if dark[y * w + x] { darkCount += 1 }
+        }
+        if Double(paintCount) >= Double(h) * 0.8 {
             for y in 0..<h { paint[y * w + x] = false }
+        }
+        if Double(darkCount) >= Double(h) * 0.8 {
+            for y in 0..<h { dark[y * w + x] = false }
         }
     }
 
     let colored = largestRim(paint, hues: hues, w: w, h: h, x0: x0, y0: y0, gateHue: true)
         ?? largestRim(pastel, hues: hues, w: w, h: h, x0: x0, y0: y0, gateHue: true)
+        ?? largestRim(dark, hues: hues, w: w, h: h, x0: x0, y0: y0, gateHue: false)
     // White is the couch only when the bay has no colored rim. A locked bay has a green plus
     // and no colored rim, so its pale border is not a white couch.
     let best = colored ?? (bayHasLockPlus(bitmap, x0: x0, y0: y0, w: w, h: h)
